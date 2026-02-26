@@ -66,7 +66,7 @@ def main(args):
     state_dim = 34  # joint_pos(16) + ee_pose_6d(18)
     action_dim = 20  # ee_pose_6d(18) + gripper(2)
     lr_backbone = 1e-5
-    backbone = 'dino_v2'
+    backbone = 'resnet18'
     if policy_class == 'ACT':
         enc_layers = 4
         dec_layers = 7
@@ -206,9 +206,9 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     train_dataloader = repeater(train_dataloader)
     for epoch in tqdm(range(num_epochs)):
-        if epoch % 100 == 0:
+        if epoch % 1000 == 0:
             print(f'\nEpoch {epoch}')
-        if epoch % 10 == 0:
+        if epoch % 100 == 0:
         # validation
             with torch.inference_mode():
                 policy.eval()
@@ -252,7 +252,7 @@ def train_bc(train_dataloader, val_dataloader, config):
 
         # epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        if epoch % 10 == 0:
+        if epoch % 100 == 0:
             print(f'Train loss: {epoch_train_loss:.5f}')
         wandb.log(epoch_summary, step=epoch)
 

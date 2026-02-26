@@ -119,20 +119,31 @@ class DETRVAE(nn.Module):
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
-            featuress, poss = self.backbones[0](image.flatten(0, 1)) # HARDCODED
-            featuress = featuress[0].view(image.shape[0], image.shape[1], 384, 16, 22) # take the last layer feature
-            pos = poss[0]
             for cam_id, cam_name in enumerate(self.camera_names):
-                # start = time.time()
-                # import ipdb; ipdb.set_trace()
-                features = featuress[:, cam_id] # HARDCODED
-                # features, pos = self.backbones[cam_id](image[:, cam_id]) # HARDCODED
-                # print("Time for 1 backbone: ", time.time() - start, image.shape)
-                # features = features[0] # take the last layer feature
-                # pos = pos[0]
+                features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED
+                features = features[0] # take the last layer feature
+                pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos/2+ cam_id - 0.5)
-                # break
+                all_cam_pos.append(pos)
+
+        # if self.backbones is not None:
+        #     # Image observation features and position embeddings
+        #     all_cam_features = []
+        #     all_cam_pos = []
+        #     featuress, poss = self.backbones[0](image.flatten(0, 1)) # HARDCODED
+        #     featuress = featuress[0].view(image.shape[0], image.shape[1], 384, 16, 22) # take the last layer feature
+        #     pos = poss[0]
+        #     for cam_id, cam_name in enumerate(self.camera_names):
+        #         # start = time.time()
+        #         # import ipdb; ipdb.set_trace()
+        #         features = featuress[:, cam_id] # HARDCODED
+        #         # features, pos = self.backbones[cam_id](image[:, cam_id]) # HARDCODED
+        #         # print("Time for 1 backbone: ", time.time() - start, image.shape)
+        #         # features = features[0] # take the last layer feature
+        #         # pos = pos[0]
+        #         all_cam_features.append(self.input_proj(features))
+        #         all_cam_pos.append(pos/2+ cam_id - 0.5)
+        #         # break
 
             # for cam_id, cam_name in enumerate(self.camera_names):
             #     features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED

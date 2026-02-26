@@ -1,0 +1,15 @@
+data/
+.idea/
+__MACOSX/
+.vscode/
+.DS_Store
+*pycache*
+*.pyc
+*.egg-info
+*.mp4
+*build/
+*.pem
+*.webm
+*.jpg
+*.svo
+*.png.vscode/

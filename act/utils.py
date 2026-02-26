@@ -9,7 +9,7 @@ e = IPython.embed
 from pathlib import Path
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, episode_len, history_stack=0):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, episode_len, chunk_size, history_stack=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -17,7 +17,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.is_sim = None
         self.max_pad_len = 200
-        action_str = 'qpos_action'
+        action_str = 'action/ee_pose'
 
         self.history_stack = history_stack
 
@@ -33,15 +33,17 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.actions = []
 
         for i, episode_id in enumerate(self.episode_ids):
-            self.dataset_paths.append(os.path.join(self.dataset_dir, f'processed_episode_{episode_id}.hdf5'))
+            self.dataset_paths.append(os.path.join(self.dataset_dir, episode_id))
             root = h5py.File(self.dataset_paths[i], 'r')
             self.roots.append(root)
             self.is_sims.append(root.attrs['sim'])
             self.original_action_shapes.append(root[action_str].shape)
 
-            self.states.append(np.array(root['observation.state']))
+            joint_pos = np.array(root['observation/state/joint_pos'])
+            ee_pose   = np.array(root['observation/state/ee_pose'])
+            self.states.append(np.concatenate([joint_pos, ee_pose], axis=-1))
             for cam_name in self.camera_names:
-                self.image_dict[cam_name].append(root[f'observation.image.{cam_name}'])
+                self.image_dict[cam_name].append(root[f'observation/image/{cam_name}'])
             self.actions.append(np.array(root[action_str]))
 
         self.is_sim = self.is_sims[0]
@@ -122,15 +124,16 @@ class EpisodicDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_norm_stats(dataset_dir, num_episodes):
-    action_str = 'qpos_action'
+def get_norm_stats(dataset_dir, episode_files):
+    action_str = 'action/ee_pose'
     all_qpos_data = []
     all_action_data = []
     all_episode_len = []
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'processed_episode_{episode_idx}.hdf5')
+    for episode_file in episode_files:
+        dataset_path = os.path.join(dataset_dir, episode_file)
         with h5py.File(dataset_path, 'r') as root:
-            qpos = root['observation.state'][()]
+            joint_pos = root['observation/state/joint_pos'][()]
+            qpos = np.concatenate([joint_pos, root['observation/state/ee_pose'][()]], axis=-1)
             action = root[action_str][()]
         all_qpos_data.append(torch.from_numpy(qpos))
         all_action_data.append(torch.from_numpy(action))
@@ -170,31 +173,35 @@ def BatchSampler(batch_size, episode_len_l, sample_weights=None):
             batch.append(step_idx)
         yield batch
 
-def load_data(dataset_dir, camera_names, batch_size_train, batch_size_val):
+def load_data(dataset_dir, camera_names, batch_size_train, batch_size_val, chunk_size):
     print(f'\nData from: {dataset_dir}\n')
 
-    all_eps = find_all_processed_episodes(dataset_dir)
+    all_eps = sorted(find_all_processed_episodes(dataset_dir))
     num_episodes = len(all_eps)
-    
+
     # obtain train test split
     train_ratio = 0.99
     shuffled_indices = np.random.permutation(num_episodes)
-    train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
-    val_indices = shuffled_indices[int(train_ratio * num_episodes):]
+    train_indices = shuffled_indices[:max(1, int(train_ratio * num_episodes))]
+    val_indices = shuffled_indices[max(1, int(train_ratio * num_episodes)):]
+    if len(val_indices) == 0:
+        val_indices = train_indices
     print(f"Train episodes: {len(train_indices)}, Val episodes: {len(val_indices)}")
     # obtain normalization stats for qpos and action
-    norm_stats, all_episode_len = get_norm_stats(dataset_dir, num_episodes)
+    norm_stats, all_episode_len = get_norm_stats(dataset_dir, all_eps)
 
     train_episode_len_l = [all_episode_len[i] for i in train_indices]
     val_episode_len_l = [all_episode_len[i] for i in val_indices]
+    train_episode_files = [all_eps[i] for i in train_indices]
+    val_episode_files = [all_eps[i] for i in val_indices]
     batch_sampler_train = BatchSampler(batch_size_train, train_episode_len_l)
     batch_sampler_val = BatchSampler(batch_size_val, val_episode_len_l, None)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, train_episode_len_l)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, val_episode_len_l)
-    train_dataloader = DataLoader(train_dataset, batch_sampler=batch_sampler_train, pin_memory=True, num_workers=24, prefetch_factor=2)
-    val_dataloader = DataLoader(val_dataset, batch_sampler=batch_sampler_val, pin_memory=True, num_workers=16, prefetch_factor=2)
+    train_dataset = EpisodicDataset(train_episode_files, dataset_dir, camera_names, norm_stats, train_episode_len_l, chunk_size)
+    val_dataset = EpisodicDataset(val_episode_files, dataset_dir, camera_names, norm_stats, val_episode_len_l, chunk_size)
+    train_dataloader = DataLoader(train_dataset, batch_sampler=batch_sampler_train, pin_memory=True, num_workers=12, prefetch_factor=2)
+    val_dataloader = DataLoader(val_dataset, batch_sampler=batch_sampler_val, pin_memory=True, num_workers=12, prefetch_factor=2)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 

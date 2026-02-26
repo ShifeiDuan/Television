@@ -60,11 +60,11 @@ def main(args):
     # ckpt_dir = task_config['ckpt_dir']
     # num_episodes = task_config['num_episodes']
     # episode_len = task_config['episode_len']
-    camera_names = ['left', 'right']
+    camera_names = ['left', 'right', 'middle']
 
     # fixed parameters
-    state_dim = 26
-    action_dim = 28
+    state_dim = 34  # joint_pos(16) + ee_pose_6d(18)
+    action_dim = 20  # ee_pose_6d(18) + gripper(2)
     lr_backbone = 1e-5
     backbone = 'dino_v2'
     if policy_class == 'ACT':
@@ -113,9 +113,9 @@ def main(args):
         'exptid': args['exptid'],
     }
     mode = "disabled" if args["no_wandb"] or args["save_jit"] else "online"
-    wandb.init(project="television", name=args['exptid'], group=task_name, entity="cxx", mode=mode, dir="../data/logs")
+    wandb.init(project="television", name=args['exptid'], group=task_name, mode=mode, dir="../data/logs")
     wandb.config.update(config)
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, camera_names, batch_size_train, batch_size_val, args['chunk_size'])
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -199,15 +199,16 @@ def train_bc(train_dataloader, val_dataloader, config):
         # checkpoint = torch.load(resume_path)
         # policy.load_state_dict(checkpoint)
 
-    # train_history = []
-    # validation_history = []
+    train_history = []
+    validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
 
     train_dataloader = repeater(train_dataloader)
     for epoch in tqdm(range(num_epochs)):
-        print(f'\nEpoch {epoch}')
-        if epoch % 500 == 0:
+        if epoch % 100 == 0:
+            print(f'\nEpoch {epoch}')
+        if epoch % 10 == 0:
         # validation
             with torch.inference_mode():
                 policy.eval()
@@ -224,6 +225,7 @@ def train_bc(train_dataloader, val_dataloader, config):
                 if epoch_val_loss < min_val_loss:
                     min_val_loss = epoch_val_loss
                     best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+            validation_history.append(deepcopy(validation_summary))
             for k in list(validation_summary.keys()):
                 validation_summary[f'val/{k}'] = validation_summary.pop(k)            
             wandb.log(validation_summary, step=epoch)
@@ -246,20 +248,18 @@ def train_bc(train_dataloader, val_dataloader, config):
         optimizer.zero_grad()
         
         epoch_summary = detach_dict(forward_dict)
+        train_history.append(epoch_summary)
 
         # epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        if epoch % 10 == 0:
+            print(f'Train loss: {epoch_train_loss:.5f}')
         wandb.log(epoch_summary, step=epoch)
 
         if epoch % 1000 == 0 and epoch >= 1000:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
-            # plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
+            plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
@@ -270,7 +270,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
     # save training curves
-    # plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
 
     return best_ckpt_info
 
@@ -317,7 +317,7 @@ def save_jit(config):
     policy, ckpt_name, epoch = load_ckpt(policy, exp_dir, config['resume_ckpt'])
 
     policy.eval()
-    image_data = torch.rand((1, 2, 3, 480, 640), device='cuda')
+    image_data = torch.rand((1, len(config['policy_config']['camera_names']), 3, 480, 640), device='cuda')
     qpos_data = torch.rand((1, config['state_dim']), device='cuda')
     input_data = (qpos_data, image_data)
 

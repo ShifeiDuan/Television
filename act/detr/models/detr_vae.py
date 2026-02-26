@@ -120,7 +120,7 @@ class DETRVAE(nn.Module):
             all_cam_features = []
             all_cam_pos = []
             featuress, poss = self.backbones[0](image.flatten(0, 1)) # HARDCODED
-            featuress = featuress[0].view(image.shape[0], 2, 384, 16, 22) # take the last layer feature
+            featuress = featuress[0].view(image.shape[0], image.shape[1], 384, 16, 22) # take the last layer feature
             pos = poss[0]
             for cam_id, cam_name in enumerate(self.camera_names):
                 # start = time.time()

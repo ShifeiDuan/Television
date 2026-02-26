@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torchvision
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
+from torchvision.models import ResNet18_Weights
 from typing import Dict, List
 
 from util.misc import NestedTensor, is_main_process
@@ -26,6 +27,8 @@ class FrozenBatchNorm2d(torch.nn.Module):
     without which any other policy_models than torchvision.policy_models.resnet[18,34,50,101]
     produce nans.
     """
+
+    
 
     def __init__(self, n):
         super(FrozenBatchNorm2d, self).__init__()

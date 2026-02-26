@@ -207,8 +207,8 @@ def load_data(dataset_dir, camera_names, batch_size_train, batch_size_val, chunk
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_episode_files, dataset_dir, camera_names, norm_stats, train_episode_len_l, chunk_size)
     val_dataset = EpisodicDataset(val_episode_files, dataset_dir, camera_names, norm_stats, val_episode_len_l, chunk_size)
-    train_dataloader = DataLoader(train_dataset, batch_sampler=batch_sampler_train, pin_memory=True, num_workers=24, prefetch_factor=2)
-    val_dataloader = DataLoader(val_dataset, batch_sampler=batch_sampler_val, pin_memory=True, num_workers=16, prefetch_factor=2)
+    train_dataloader = DataLoader(train_dataset, batch_sampler=batch_sampler_train, pin_memory=True, num_workers=10, prefetch_factor=2)
+    val_dataloader = DataLoader(val_dataset, batch_sampler=batch_sampler_val, pin_memory=True, num_workers=10, prefetch_factor=2)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 

@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
 Offline deployment node: replays a processed episode through the trained ACT policy
-and publishes predicted actions via roslibpy (no native ROS install required).
-
-Requires rosbridge_server running in Docker:
-    # ROS1: rosrun rosbridge_server rosbridge_websocket
-    # ROS2: ros2 launch rosbridge_server rosbridge_websocket_launch.xml
-    Docker port: -p 9090:9090
+and publishes predicted actions via native ROS2.
 
 Usage:
     python deploy_ros2.py \
@@ -23,6 +18,12 @@ Topics published:
     /act/arm1/gt_pose     (geometry_msgs/PoseStamped)  ground truth arm1 EE pose
     /act/gripper          (std_msgs/Float32MultiArray)  [grp0, grp1] predicted
     /act/action_raw       (std_msgs/Float32MultiArray)  full 20-dim denormed action
+
+TF frames broadcast:
+    arm_0/base_link → arm_0/pred_ee   predicted arm0 EE
+    arm_1/base_link → arm_1/pred_ee   predicted arm1 EE
+    arm_0/base_link → arm_0/gt_ee     ground truth arm0 EE
+    arm_1/base_link → arm_1/gt_ee     ground truth arm1 EE
 
 Action layout (20-dim, from post_process.py):
     [0:3]   arm0 pos (x,y,z)
@@ -42,7 +43,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import h5py
-import roslibpy
+import rclpy
+from rclpy.node import Node
+import tf2_ros
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from std_msgs.msg import Float32MultiArray
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / 'act'))
 from policy import ACTPolicy
@@ -107,7 +112,7 @@ def load_policy(ckpt_path, state_dim, action_dim, chunk_size,
         'hidden_dim': hidden_dim,
         'dim_feedforward': dim_feedforward,
         'lr_backbone': 1e-5,
-        'backbone': 'dino_v2',
+        'backbone': 'resnet18',
         'enc_layers': enc_layers,
         'dec_layers': dec_layers,
         'nheads': nheads,
@@ -133,35 +138,39 @@ def merge_act(all_time_actions, t, k=0.01):
     return (actions * weights).sum(axis=0)
 
 
-def make_pose_msg(pos, quat, frame_id):
-    """Return a roslibpy-compatible PoseStamped dict.
+def make_pose_msg(node, pos, quat, frame_id):
+    """Return a ROS2 PoseStamped message.
     pos: [x,y,z], quat: [x,y,z,w]
     """
-    now = time.time()
-    return {
-        'header': {
-            'frame_id': frame_id,
-            'stamp': {'sec': int(now), 'nanosec': int((now % 1) * 1e9)},
-        },
-        'pose': {
-            'position':    {'x': float(pos[0]),  'y': float(pos[1]),  'z': float(pos[2])},
-            'orientation': {'x': float(quat[0]), 'y': float(quat[1]),
-                            'z': float(quat[2]), 'w': float(quat[3])},
-        },
-    }
+    msg = PoseStamped()
+    msg.header.frame_id = frame_id
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.pose.position.x    = float(pos[0])
+    msg.pose.position.y    = float(pos[1])
+    msg.pose.position.z    = float(pos[2])
+    msg.pose.orientation.x = float(quat[0])
+    msg.pose.orientation.y = float(quat[1])
+    msg.pose.orientation.z = float(quat[2])
+    msg.pose.orientation.w = float(quat[3])
+    return msg
 
 
 # ── Deploy class ──────────────────────────────────────────────────────────────
 
-class DeployNode:
-    def __init__(self, args, ros_client):
-        # Publishers (via roslibpy)
-        self.pub_pred_arm0 = roslibpy.Topic(ros_client, '/act/arm0/pred_pose', 'geometry_msgs/PoseStamped')
-        self.pub_pred_arm1 = roslibpy.Topic(ros_client, '/act/arm1/pred_pose', 'geometry_msgs/PoseStamped')
-        self.pub_gt_arm0   = roslibpy.Topic(ros_client, '/act/arm0/gt_pose',   'geometry_msgs/PoseStamped')
-        self.pub_gt_arm1   = roslibpy.Topic(ros_client, '/act/arm1/gt_pose',   'geometry_msgs/PoseStamped')
-        self.pub_gripper   = roslibpy.Topic(ros_client, '/act/gripper',        'std_msgs/Float32MultiArray')
-        self.pub_action    = roslibpy.Topic(ros_client, '/act/action_raw',     'std_msgs/Float32MultiArray')
+class DeployNode(Node):
+    def __init__(self, args):
+        super().__init__('act_deploy')
+
+        # TF broadcaster
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
+        # Publishers
+        self.pub_pred_arm0 = self.create_publisher(PoseStamped,       '/act/arm0/pred_pose', 10)
+        self.pub_pred_arm1 = self.create_publisher(PoseStamped,       '/act/arm1/pred_pose', 10)
+        self.pub_gt_arm0   = self.create_publisher(PoseStamped,       '/act/arm0/gt_pose',   10)
+        self.pub_gt_arm1   = self.create_publisher(PoseStamped,       '/act/arm1/gt_pose',   10)
+        self.pub_gripper   = self.create_publisher(Float32MultiArray, '/act/gripper',        10)
+        self.pub_action    = self.create_publisher(Float32MultiArray, '/act/action_raw',     10)
 
         # Locate experiment directory
         task_dir, task_name = parse_id(RECORD_DIR, args['taskid'])
@@ -171,7 +180,7 @@ class DeployNode:
         stats_path = Path(exp_dir) / 'dataset_stats.pkl'
         with open(stats_path, 'rb') as f:
             self.norm_stats = pickle.load(f)
-        print(f'Loaded norm stats from {stats_path}')
+        self.get_logger().info(f'Loaded norm stats from {stats_path}')
 
         # Load policy
         ckpt_path = Path(exp_dir) / args['ckpt']
@@ -186,24 +195,24 @@ class DeployNode:
             nheads=args['nheads'],
             dim_feedforward=args['dim_feedforward'],
         )
-        print(f'Loaded policy from {ckpt_path}')
+        self.get_logger().info(f'Loaded policy from {ckpt_path}')
 
         # Load episode data
         episode_path = Path(task_dir) / 'processed' / args['episode']
         with h5py.File(str(episode_path), 'r') as f:
             # qpos: ee_pose(18) + gripper(2) = 20-dim  (matches training utils.py)
-            ee_pose   = np.array(f['observation/state/ee_pose'],   dtype=np.float32)  # (T, 18)
-            joint_pos = np.array(f['observation/state/joint_pos'], dtype=np.float32)  # (T, N)
-            gripper   = joint_pos[:, [12, 14]]                                         # (T, 2)
-            self.states = np.concatenate([ee_pose, gripper], axis=-1)                 # (T, 20)
+            ee_pose   = f['observation/state/ee_pose'][:].astype(np.float32)   # (T, 18)
+            joint_pos = f['observation/state/joint_pos'][:].astype(np.float32) # (T, N)
+            gripper   = joint_pos[:, [12, 14]]                                  # (T, 2)
+            self.states = np.concatenate([ee_pose, gripper], axis=-1)          # (T, 20)
 
-            self.gt_actions = np.array(f['action/ee_pose'], dtype=np.float32)         # (T, 20)
+            self.gt_actions = f['action/ee_pose'][:].astype(np.float32)        # (T, 20)
             self.imgs = {
-                cam: np.array(f[f'observation/image/{cam}'])
+                cam: f[f'observation/image/{cam}'][:]
                 for cam in ['left', 'right', 'middle']
             }
         self.T = self.states.shape[0]
-        print(f'Episode: {episode_path.name}  ({self.T} steps)')
+        self.get_logger().info(f'Episode: {episode_path.name}  ({self.T} steps)')
 
         self.chunk_size   = args['chunk_size']
         self.action_dim   = args['action_dim']
@@ -243,31 +252,59 @@ class DeployNode:
         act = act_normed * self.norm_stats['action_std'] + self.norm_stats['action_mean']
         # act layout (20-dim): arm0_pos(3)+arm0_rot6d(6) | arm1_pos(3)+arm1_rot6d(6) | grp0 | grp1
 
-        # ── Publish predicted poses ──────────────────────────────────────────
-        self.pub_pred_arm0.publish(roslibpy.Message(
-            make_pose_msg(act[0:3], rot6d_to_quat(act[3:9]), 'arm_0/base_link')))
-        self.pub_pred_arm1.publish(roslibpy.Message(
-            make_pose_msg(act[9:12], rot6d_to_quat(act[12:18]), 'arm_1/base_link')))
+        # ── Publish predicted poses + TF ─────────────────────────────────────
+        stamp = self.get_clock().now().to_msg()
+        q0_pred = rot6d_to_quat(act[3:9])
+        q1_pred = rot6d_to_quat(act[12:18])
+        self.pub_pred_arm0.publish(make_pose_msg(self, act[0:3],  q0_pred, 'arm_0/base_link'))
+        self.pub_pred_arm1.publish(make_pose_msg(self, act[9:12], q1_pred, 'arm_1/base_link'))
+
+        def make_tf(parent, child, pos, quat):
+            tf = TransformStamped()
+            tf.header.stamp    = stamp
+            tf.header.frame_id = parent
+            tf.child_frame_id  = child
+            tf.transform.translation.x = float(pos[0])
+            tf.transform.translation.y = float(pos[1])
+            tf.transform.translation.z = float(pos[2])
+            tf.transform.rotation.x = float(quat[0])
+            tf.transform.rotation.y = float(quat[1])
+            tf.transform.rotation.z = float(quat[2])
+            tf.transform.rotation.w = float(quat[3])
+            return tf
+
+        self.tf_broadcaster.sendTransform([
+            make_tf('arm_0/base_link', 'arm_0/pred_ee', act[0:3],  q0_pred),
+            make_tf('arm_1/base_link', 'arm_1/pred_ee', act[9:12], q1_pred),
+        ])
 
         # ── Publish gripper ──────────────────────────────────────────────────
-        self.pub_gripper.publish(roslibpy.Message(
-            {'data': [float(act[18]), float(act[19])]}))
+        grp_msg = Float32MultiArray()
+        grp_msg.data = [float(act[18]), float(act[19])]
+        self.pub_gripper.publish(grp_msg)
 
-        # ── Publish ground-truth poses ───────────────────────────────────────
+        # ── Publish ground-truth poses + TF ──────────────────────────────────
         gt = self.gt_actions[t]
-        self.pub_gt_arm0.publish(roslibpy.Message(
-            make_pose_msg(gt[0:3], rot6d_to_quat(gt[3:9]), 'arm_0/base_link')))
-        self.pub_gt_arm1.publish(roslibpy.Message(
-            make_pose_msg(gt[9:12], rot6d_to_quat(gt[12:18]), 'arm_1/base_link')))
+        q0_gt = rot6d_to_quat(gt[3:9])
+        q1_gt = rot6d_to_quat(gt[12:18])
+        self.pub_gt_arm0.publish(make_pose_msg(self, gt[0:3],  q0_gt, 'arm_0/base_link'))
+        self.pub_gt_arm1.publish(make_pose_msg(self, gt[9:12], q1_gt, 'arm_1/base_link'))
+
+        self.tf_broadcaster.sendTransform([
+            make_tf('arm_0/base_link', 'arm_0/gt_ee', gt[0:3],  q0_gt),
+            make_tf('arm_1/base_link', 'arm_1/gt_ee', gt[9:12], q1_gt),
+        ])
 
         # ── Publish full action ──────────────────────────────────────────────
-        self.pub_action.publish(roslibpy.Message(
-            {'data': act.tolist()}))
+        act_msg = Float32MultiArray()
+        act_msg.data = act.tolist()
+        self.pub_action.publish(act_msg)
 
-        print(f't={t:4d}/{self.T} | '
-              f'arm0 pos=[{act[0]:.3f},{act[1]:.3f},{act[2]:.3f}] | '
-              f'arm1 pos=[{act[9]:.3f},{act[10]:.3f},{act[11]:.3f}] | '
-              f'gripper=[{act[18]:.3f},{act[19]:.3f}]')
+        self.get_logger().info(
+            f't={t:4d}/{self.T} | '
+            f'arm0 pos=[{act[0]:.3f},{act[1]:.3f},{act[2]:.3f}] | '
+            f'arm1 pos=[{act[9]:.3f},{act[10]:.3f},{act[11]:.3f}] | '
+            f'gripper=[{act[18]:.3f},{act[19]:.3f}]')
 
     def run(self):
         period = 1.0 / self.hz
@@ -278,7 +315,7 @@ class DeployNode:
             sleep_time = period - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-        print('Episode replay finished.')
+        self.get_logger().info('Episode replay finished.')
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -302,32 +339,17 @@ def main():
     parser.add_argument('--dim_feedforward', type=int,   default=3200)
     parser.add_argument('--frame_id',        type=str,   default='base_link')
     parser.add_argument('--temporal_agg',    action='store_true')
-    parser.add_argument('--ros_host',        type=str,   default='localhost',
-                        help='rosbridge host (Docker IP or localhost if --network=host)')
-    parser.add_argument('--ros_port',        type=int,   default=9090)
     args = vars(parser.parse_args())
 
-    client = roslibpy.Ros(host=args['ros_host'], port=args['ros_port'])
-    client.run()
-
-    # Wait for connection (client.run() is non-blocking)
-    timeout = 5.0
-    t0 = time.time()
-    while not client.is_connected and time.time() - t0 < timeout:
-        time.sleep(0.1)
-    if not client.is_connected:
-        print(f"ERROR: Could not connect to rosbridge at {args['ros_host']}:{args['ros_port']}")
-        client.terminate()
-        return
-    print(f"Connected to rosbridge at {args['ros_host']}:{args['ros_port']}")
-
-    node = DeployNode(args, client)
+    rclpy.init()
+    node = DeployNode(args)
     try:
         node.run()
     except KeyboardInterrupt:
-        print('Interrupted.')
+        node.get_logger().info('Interrupted.')
     finally:
-        client.terminate()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

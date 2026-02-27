@@ -298,7 +298,15 @@ def process_episode(path: str, ep_base: str) -> str:
         # joint_pos layout: arm0[0:6], arm1[6:12], grp0[12:14], grp1[14:16]
         # use half_aperture_joint of each gripper (index 12, 14)
         action_ee_6d = ee_pose_to_6d(action_ee)      # (T, 18)
-        gripper = joint_pos[:, [12, 14]]              # (T, 2)
+        # Shift gripper label forward N frames so the model learns to predict
+        # the future gripper state (i.e., a command) rather than current state.
+        # N=20 @ 25Hz = 800ms lookahead (measured gripper close time ~0.9s).
+        GRIPPER_SHIFT = 20
+        grp_raw = joint_pos[:, [12, 14]]              # (T, 2)
+        gripper = np.concatenate([
+            grp_raw[GRIPPER_SHIFT:],                              # (T-N, 2)
+            np.tile(grp_raw[[-1]], (GRIPPER_SHIFT, 1)),           # pad tail
+        ], axis=0)                                                # (T, 2)
         action_ee_with_gripper = np.concatenate([action_ee_6d, gripper], axis=-1)  # (T, 20)
         act_grp = f.create_group('action')
         act_grp.create_dataset('ee_pose', data=action_ee_with_gripper, compression='gzip')
@@ -351,7 +359,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description='Post-process dual-arm recorder episodes into merged HDF5 files.')
     parser.add_argument('--path',     type=str,
-                        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'recordings', '00-peg-in-hole'),
+                        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'recordings', '01-pt'),
                         help='Directory containing raw episode files')
     parser.add_argument('--episode',  type=str, default=None,
                         help='Process a single episode base name (optional)')

@@ -260,6 +260,29 @@ def process_episode(path: str, ep_base: str) -> str:
     action_ee      = action_ee[:T]
     action_gripper = action_gripper[:T]
 
+    # ── 去掉开头的静态等待阶段（action 还没开始移动前的步骤）──────────────
+    # 原因：每个 episode 前几十到上百步，机器人在 home 位置等待 MoveIt 规划，
+    # 此时 action == obs == home，模型会学到 "home→原地不动" 的 identity mapping，
+    # 导致部署时机器人完全不动。去掉这段可消除该偏置。
+    arm0_init = action_ee[0, 0:3]
+    arm1_init = action_ee[0, 7:10]
+    arm0_dist = np.linalg.norm(action_ee[:, 0:3]  - arm0_init, axis=1) * 100  # cm
+    arm1_dist = np.linalg.norm(action_ee[:, 7:10] - arm1_init, axis=1) * 100  # cm
+    moved = np.maximum(arm0_dist, arm1_dist) > 2.0   # 双臂中任意一臂移动超过 2cm
+    first_move = int(np.argmax(moved)) if moved.any() else 0
+    if first_move > 0:
+        print(f"  [TRIM] 去除开头 {first_move} 步静态等待阶段（action 未移动 >2cm）")
+        imgs_left      = imgs_left[first_move:]
+        imgs_right     = imgs_right[first_move:]
+        imgs_middle    = imgs_middle[first_move:]
+        timestamps     = timestamps[first_move:]
+        ee_pose        = ee_pose[first_move:]
+        joint_pos      = joint_pos[first_move:]
+        action_ee      = action_ee[first_move:]
+        action_gripper = action_gripper[first_move:]
+        T = len(timestamps)
+        print(f"  [TRIM] 剩余 {T} 步")
+
     # ── 重采样到均匀时间网格 ────────────────────────────────────────────────
     target_hz = float(meta.get('recording_frequency', 50.0))
     (timestamps, ee_pose, joint_pos, action_ee, action_gripper,

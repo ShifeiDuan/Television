@@ -112,34 +112,36 @@ def load_hdf5(hdf5_path: str):
 
     Returns
     -------
-    timestamps : (T,)    float64  seconds
-    ee_pose    : (T, 14) float32
-    joint_pos  : (T, N)  float32
-    action_ee  : (T, 14) float32
-    meta       : dict    original metadata attributes
+    timestamps      : (T,)    float64  seconds
+    ee_pose         : (T, 14) float32
+    joint_pos       : (T, N)  float32
+    action_ee       : (T, 14) float32
+    action_gripper  : (T, 2)  float32
+    meta            : dict    original metadata attributes
     """
     with h5py.File(hdf5_path, 'r') as f:
-        timestamps = np.array(f['obs/timestamp'][:],  dtype=np.float64)
-        ee_pose    = np.array(f['obs/ee_pose'][:],    dtype=np.float32)
-        joint_pos  = np.array(f['obs/joint_pos'][:],  dtype=np.float32)
-        action_ee  = np.array(f['action/ee_pose'][:], dtype=np.float32)
+        timestamps     = np.array(f['obs/timestamp'][:],       dtype=np.float64)
+        ee_pose        = np.array(f['obs/ee_pose'][:],         dtype=np.float32)
+        joint_pos      = np.array(f['obs/joint_pos'][:],       dtype=np.float32)
+        action_ee      = np.array(f['action/ee_pose'][:],      dtype=np.float32)
+        action_gripper = np.array(f['action/gripper_cmd'][:],  dtype=np.float32)
 
         meta = {}
         if 'metadata' in f:
             for k, v in f['metadata'].attrs.items():
                 meta[k] = v
 
-    return timestamps, ee_pose, joint_pos, action_ee, meta
+    return timestamps, ee_pose, joint_pos, action_ee, action_gripper, meta
 
 
 # ── Resampling ────────────────────────────────────────────────────────────────
 
-def resample_to_uniform_hz(timestamps, ee_pose, joint_pos, action_ee,
+def resample_to_uniform_hz(timestamps, ee_pose, joint_pos, action_ee, action_gripper,
                             imgs_left, imgs_right, imgs_middle,
                             target_hz: float = 50.0):
     """把所有数据重采样到均匀的 target_hz 网格。
 
-    标量数据（ee_pose / joint_pos / action_ee）线性插值；
+    标量数据（ee_pose / joint_pos / action_ee / action_gripper）线性插值；
     图像用最近邻（不做帧间混合）；四元数部分插值后归一化。
     """
     t0, t1 = timestamps[0], timestamps[-1]
@@ -158,6 +160,7 @@ def resample_to_uniform_hz(timestamps, ee_pose, joint_pos, action_ee,
     ee_r   = interp(ee_pose)
     jpos_r = interp(joint_pos)
     act_r  = interp(action_ee)
+    grp_r  = interp(action_gripper)
 
     # 四元数归一化（arm0: [3:7], arm1: [10:14]）
     for s in (slice(3, 7), slice(10, 14)):
@@ -173,7 +176,7 @@ def resample_to_uniform_hz(timestamps, ee_pose, joint_pos, action_ee,
                 np.abs(timestamps[idx]   - t_new))
     idx[use_left] = idx_l[use_left]
 
-    return (t_new, ee_r, jpos_r, act_r,
+    return (t_new, ee_r, jpos_r, act_r, grp_r,
             imgs_left[idx], imgs_right[idx], imgs_middle[idx])
 
 
@@ -226,7 +229,7 @@ def process_episode(path: str, ep_base: str) -> str:
     print(f"Processing: {ep_base}")
 
     # ── Load HDF5 ──────────────────────────────────────────────────────────
-    timestamps, ee_pose, joint_pos, action_ee, meta = load_hdf5(hdf5_path)
+    timestamps, ee_pose, joint_pos, action_ee, action_gripper, meta = load_hdf5(hdf5_path)
     T_hdf5 = len(timestamps)
     print(f"  HDF5 steps : {T_hdf5}")
     delta = np.diff(timestamps)
@@ -254,13 +257,14 @@ def process_episode(path: str, ep_base: str) -> str:
     timestamps  = timestamps[:T]
     ee_pose     = ee_pose[:T]
     joint_pos   = joint_pos[:T]
-    action_ee   = action_ee[:T]
+    action_ee      = action_ee[:T]
+    action_gripper = action_gripper[:T]
 
     # ── 重采样到均匀时间网格 ────────────────────────────────────────────────
     target_hz = float(meta.get('recording_frequency', 50.0))
-    (timestamps, ee_pose, joint_pos, action_ee,
+    (timestamps, ee_pose, joint_pos, action_ee, action_gripper,
      imgs_left, imgs_right, imgs_middle) = resample_to_uniform_hz(
-        timestamps, ee_pose, joint_pos, action_ee,
+        timestamps, ee_pose, joint_pos, action_ee, action_gripper,
         imgs_left, imgs_right, imgs_middle,
         target_hz=target_hz,
     )
@@ -294,20 +298,9 @@ def process_episode(path: str, ep_base: str) -> str:
         # Timestamps (actual ROS wall-clock, seconds)
         f.create_dataset('observation/timestamp', data=timestamps, compression='gzip')
 
-        # Action: ee_pose_6d(18) + gripper(2) = 20 dims
-        # joint_pos layout: arm0[0:6], arm1[6:12], grp0[12:14], grp1[14:16]
-        # use half_aperture_joint of each gripper (index 12, 14)
-        action_ee_6d = ee_pose_to_6d(action_ee)      # (T, 18)
-        # Shift gripper label forward N frames so the model learns to predict
-        # the future gripper state (i.e., a command) rather than current state.
-        # N=20 @ 25Hz = 800ms lookahead (measured gripper close time ~0.9s).
-        GRIPPER_SHIFT = 20
-        grp_raw = joint_pos[:, [12, 14]]              # (T, 2)
-        gripper = np.concatenate([
-            grp_raw[GRIPPER_SHIFT:],                              # (T-N, 2)
-            np.tile(grp_raw[[-1]], (GRIPPER_SHIFT, 1)),           # pad tail
-        ], axis=0)                                                # (T, 2)
-        action_ee_with_gripper = np.concatenate([action_ee_6d, gripper], axis=-1)  # (T, 20)
+        # Action: ee_pose_6d(18) + gripper_cmd(2) = 20 dims
+        action_ee_6d = ee_pose_to_6d(action_ee)                                    # (T, 18)
+        action_ee_with_gripper = np.concatenate([action_ee_6d, action_gripper], axis=-1)  # (T, 20)
         act_grp = f.create_group('action')
         act_grp.create_dataset('ee_pose', data=action_ee_with_gripper, compression='gzip')
 
